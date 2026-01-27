@@ -15,7 +15,7 @@ fi
 echo -e "${GREEN}=== Debian/Ubuntu SSH 端口修改专家版 ===${PLAIN}"
 
 # 2. 询问新端口
-read -p "请输入您想修改的 SSH 端口号 (建议 1024-65535): " NEW_PORT
+read -p "请输入您想修改的 SSH 端口号 (建议 1024-65535): " NEW_PORT < /dev/tty
 
 # 3. 校验输入
 if ! [[ "$NEW_PORT" =~ ^[0-9]+$ ]] || [ "$NEW_PORT" -lt 1 ] || [ "$NEW_PORT" -gt 65535 ]; then
