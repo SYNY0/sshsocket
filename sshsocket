@@ -1,0 +1,101 @@
+#!/bin/bash
+
+# 定义颜色
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+PLAIN='\033[0m'
+
+# 1. 检查 Root 权限
+if [ "$(id -u)" != "0" ]; then
+    echo -e "${RED}错误: 请使用 sudo 或 root 权限运行此脚本。${PLAIN}"
+    exit 1
+fi
+
+echo -e "${GREEN}=== Debian/Ubuntu SSH 端口修改专家版 ===${PLAIN}"
+
+# 2. 询问新端口
+read -p "请输入您想修改的 SSH 端口号 (建议 1024-65535): " NEW_PORT
+
+# 3. 校验输入
+if ! [[ "$NEW_PORT" =~ ^[0-9]+$ ]] || [ "$NEW_PORT" -lt 1 ] || [ "$NEW_PORT" -gt 65535 ]; then
+    echo -e "${RED}错误: 输入无效，请输入 1 到 65535 之间的数字。${PLAIN}"
+    exit 1
+fi
+
+# 4. 备份并修改配置文件
+CONFIG_FILE="/etc/ssh/sshd_config"
+BACKUP_FILE="/etc/ssh/sshd_config.bak.$(date +%F_%T)"
+cp $CONFIG_FILE $BACKUP_FILE
+echo -e "${YELLOW}已备份配置文件至: $BACKUP_FILE${PLAIN}"
+
+# 使用 sed 修改端口
+if grep -q "^#*Port" $CONFIG_FILE; then
+    sed -i "s/^#*Port .*/Port $NEW_PORT/" $CONFIG_FILE
+else
+    echo "Port $NEW_PORT" >> $CONFIG_FILE
+fi
+
+# 5. 语法检查
+/usr/sbin/sshd -t
+if [ $? -ne 0 ]; then
+    echo -e "${RED}配置文件语法错误，正在还原...${PLAIN}"
+    cp $BACKUP_FILE $CONFIG_FILE
+    exit 1
+fi
+echo -e "${GREEN}配置文件修改成功。${PLAIN}"
+
+# ==========================================
+# 核心升级：处理 Ubuntu 的 Socket Activation
+# ==========================================
+echo -e "${YELLOW}正在检查并处理 Systemd Socket 配置...${PLAIN}"
+
+# 检查 ssh.socket 是否处于活动或加载状态
+if systemctl list-unit-files | grep -q "ssh.socket"; then
+    echo -e "${YELLOW}检测到 ssh.socket，正在禁用以确保端口修改生效...${PLAIN}"
+    
+    # 停止并禁用 socket
+    systemctl stop ssh.socket 2>/dev/null
+    systemctl disable ssh.socket 2>/dev/null
+    
+    # 彻底屏蔽 (Mask) 根除 22 端口复活的可能
+    systemctl mask ssh.socket 2>/dev/null
+    echo -e "${GREEN}已屏蔽 ssh.socket (回归经典 Standalone 模式)${PLAIN}"
+fi
+
+# ==========================================
+# 干净重启逻辑
+# ==========================================
+echo -e "${YELLOW}正在执行干净重启...${PLAIN}"
+
+# 确定服务名称 (Debian/Ubuntu 通常是 ssh，但为了保险检查 sshd)
+if systemctl list-unit-files | grep -q "^sshd.service"; then
+    SVC_NAME="sshd"
+else
+    SVC_NAME="ssh"
+fi
+
+# 你的逻辑：Stop -> Sleep -> Start
+systemctl stop $SVC_NAME
+sleep 2
+systemctl start $SVC_NAME
+
+# 6. 验证结果
+echo -e "${YELLOW}验证端口监听状态...${PLAIN}"
+if ss -tlnp | grep -q ":$NEW_PORT "; then
+    echo -e "${GREEN}SUCCESS! SSH 现在监听端口: $NEW_PORT${PLAIN}"
+    
+    # 再次检查 22 端口是否还在（如果你想彻底关掉它，这里不应该有输出）
+    if ss -tlnp | grep -q ":22 "; then
+        echo -e "${RED}警告: 检测到 22 端口依然开放，可能有其他进程占用或 socket 未清理干净。${PLAIN}"
+    else
+        echo -e "${GREEN}确认: 默认 22 端口已关闭。${PLAIN}"
+    fi
+
+    echo -e "\n${RED}【切记】请在防火墙 (UFW/云安全组) 放行端口 $NEW_PORT ！！！${PLAIN}"
+    echo -e "建议命令(如果是UFW): sudo ufw allow $NEW_PORT/tcp"
+else
+    echo -e "${RED}失败: 服务重启后未检测到新端口监听，请检查 journalctl -xe 查看错误。${PLAIN}"
+    # 如果失败，尝试回滚 socket mask，防止失联（可选）
+    # systemctl unmask ssh.socket
+fi
