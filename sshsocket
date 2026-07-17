@@ -1,101 +1,127 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Change the SSH listening port on a clean Debian/Ubuntu server.
+# Run as root.  This script deliberately does not roll back a failed restart.
 
-# 定义颜色
+set -Eeuo pipefail
+
+readonly CONFIG_FILE=/etc/ssh/sshd_config
+readonly CONFIG_DIR=/etc/ssh/sshd_config.d
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 PLAIN='\033[0m'
 
-# 1. 检查 Root 权限
-if [ "$(id -u)" != "0" ]; then
-    echo -e "${RED}错误: 请使用 sudo 或 root 权限运行此脚本。${PLAIN}"
+die() {
+    echo -e "${RED}错误: $*${PLAIN}" >&2
     exit 1
+}
+
+cleanup() {
+    [[ -n "${CANDIDATE_CONFIG:-}" && -e "${CANDIDATE_CONFIG:-}" ]] && rm -f -- "$CANDIDATE_CONFIG"
+}
+trap cleanup EXIT
+
+if [[ $(id -u) -ne 0 ]]; then
+    die '请使用 sudo 或 root 权限运行此脚本。'
 fi
 
-echo -e "${GREEN}=== Debian/Ubuntu SSH 端口修改专家版 ===${PLAIN}"
+command -v systemctl >/dev/null || die '此脚本需要 systemd。'
+command -v ss >/dev/null || die '未找到 ss 命令（iproute2）。'
 
-# 2. 询问新端口
-read -p "请输入您想修改的 SSH 端口号 (建议 1024-65535): " NEW_PORT < /dev/tty
-
-# 3. 校验输入
-if ! [[ "$NEW_PORT" =~ ^[0-9]+$ ]] || [ "$NEW_PORT" -lt 1 ] || [ "$NEW_PORT" -gt 65535 ]; then
-    echo -e "${RED}错误: 输入无效，请输入 1 到 65535 之间的数字。${PLAIN}"
-    exit 1
-fi
-
-# 4. 备份并修改配置文件
-CONFIG_FILE="/etc/ssh/sshd_config"
-BACKUP_FILE="/etc/ssh/sshd_config.bak.$(date +%F_%T)"
-cp $CONFIG_FILE $BACKUP_FILE
-echo -e "${YELLOW}已备份配置文件至: $BACKUP_FILE${PLAIN}"
-
-# 使用 sed 修改端口
-if grep -q "^#*Port" $CONFIG_FILE; then
-    sed -i "s/^#*Port .*/Port $NEW_PORT/" $CONFIG_FILE
+if [[ -x /usr/sbin/sshd ]]; then
+    SSHD_BIN=/usr/sbin/sshd
+elif command -v sshd >/dev/null; then
+    SSHD_BIN=$(command -v sshd)
 else
-    echo "Port $NEW_PORT" >> $CONFIG_FILE
+    die '未找到 sshd；请先安装 openssh-server。'
 fi
 
-# 5. 语法检查
-/usr/sbin/sshd -t
-if [ $? -ne 0 ]; then
-    echo -e "${RED}配置文件语法错误，正在还原...${PLAIN}"
-    cp $BACKUP_FILE $CONFIG_FILE
-    exit 1
-fi
-echo -e "${GREEN}配置文件修改成功。${PLAIN}"
+[[ -f "$CONFIG_FILE" ]] || die "找不到 $CONFIG_FILE。"
 
-# ==========================================
-# 核心升级：处理 Ubuntu 的 Socket Activation
-# ==========================================
-echo -e "${YELLOW}正在检查并处理 Systemd Socket 配置...${PLAIN}"
-
-# 检查 ssh.socket 是否处于活动或加载状态
-if systemctl list-unit-files | grep -q "ssh.socket"; then
-    echo -e "${YELLOW}检测到 ssh.socket，正在禁用以确保端口修改生效...${PLAIN}"
-    
-    # 停止并禁用 socket
-    systemctl stop ssh.socket 2>/dev/null
-    systemctl disable ssh.socket 2>/dev/null
-    
-    # 彻底屏蔽 (Mask) 根除 22 端口复活的可能
-    systemctl mask ssh.socket 2>/dev/null
-    echo -e "${GREEN}已屏蔽 ssh.socket (回归经典 Standalone 模式)${PLAIN}"
-fi
-
-# ==========================================
-# 干净重启逻辑
-# ==========================================
-echo -e "${YELLOW}正在执行干净重启...${PLAIN}"
-
-# 确定服务名称 (Debian/Ubuntu 通常是 ssh，但为了保险检查 sshd)
-if systemctl list-unit-files | grep -q "^sshd.service"; then
-    SVC_NAME="sshd"
+if systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '$1 == "ssh.service" { found = 1 } END { exit !found }'; then
+    SSH_SERVICE=ssh.service
+elif systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '$1 == "sshd.service" { found = 1 } END { exit !found }'; then
+    SSH_SERVICE=sshd.service
 else
-    SVC_NAME="ssh"
+    die '未找到 ssh.service 或 sshd.service。'
 fi
 
-# 你的逻辑：Stop -> Sleep -> Start
-systemctl stop $SVC_NAME
-sleep 2
-systemctl start $SVC_NAME
+echo -e "${GREEN}=== Debian/Ubuntu SSH 端口修改 ===${PLAIN}"
+read -r -p '请输入新的 SSH 端口号（1024-65535，且不能是 22）: ' NEW_PORT < /dev/tty
 
-# 6. 验证结果
-echo -e "${YELLOW}验证端口监听状态...${PLAIN}"
-if ss -tlnp | grep -q ":$NEW_PORT "; then
-    echo -e "${GREEN}SUCCESS! SSH 现在监听端口: $NEW_PORT${PLAIN}"
-    
-    # 再次检查 22 端口是否还在（如果你想彻底关掉它，这里不应该有输出）
-    if ss -tlnp | grep -q ":22 "; then
-        echo -e "${RED}警告: 检测到 22 端口依然开放，可能有其他进程占用或 socket 未清理干净。${PLAIN}"
+if ! [[ $NEW_PORT =~ ^[0-9]+$ ]] || (( NEW_PORT < 1024 || NEW_PORT > 65535 || NEW_PORT == 22 )); then
+    die '端口必须是 1024 到 65535 之间、且不等于 22 的整数。'
+fi
+
+# Do this before changing the configuration, so a conflict cannot take down SSH.
+if ss -H -ltn | awk -v port="$NEW_PORT" '$4 ~ (":" port "$") { found = 1 } END { exit !found }'; then
+    die "端口 $NEW_PORT 已被其他进程监听。"
+fi
+
+echo -e "${YELLOW}提示：如通过云服务器远程运行，请先在云安全组放行 TCP/$NEW_PORT。${PLAIN}"
+if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active$'; then
+    echo -e "${YELLOW}检测到 UFW 已启用，正在放行 TCP/$NEW_PORT...${PLAIN}"
+    ufw allow "$NEW_PORT/tcp" >/dev/null || die "无法在 UFW 中放行 TCP/$NEW_PORT。"
+fi
+
+# Build and validate a candidate first.  The pattern accepts indentation and
+# both '#Port' and '# Port', and leaves exactly one Port directive in the main
+# configuration file.
+CANDIDATE_CONFIG=$(mktemp /etc/ssh/sshd_config.candidate.XXXXXX)
+cp --preserve=mode,ownership,timestamps -- "$CONFIG_FILE" "$CANDIDATE_CONFIG"
+awk -v port="$NEW_PORT" '
+    /^[[:space:]]*#?[[:space:]]*Port[[:space:]]+[0-9]+([[:space:]]*(#.*)?)?$/ {
+        if (!written++) print "Port " port
+        next
+    }
+    { print }
+    END { if (!written) print "Port " port }
+' "$CANDIDATE_CONFIG" > "${CANDIDATE_CONFIG}.new"
+chmod --reference="$CONFIG_FILE" "${CANDIDATE_CONFIG}.new"
+chown --reference="$CONFIG_FILE" "${CANDIDATE_CONFIG}.new"
+mv -- "${CANDIDATE_CONFIG}.new" "$CANDIDATE_CONFIG"
+
+"$SSHD_BIN" -t -f "$CANDIDATE_CONFIG" || die '候选 SSH 配置语法检查失败。'
+
+# Port directives may also be brought in by sshd_config.d.  Do not silently
+# leave an old port active: refuse the change until that custom configuration
+# is made unambiguous.
+mapfile -t EFFECTIVE_PORTS < <("$SSHD_BIN" -T -f "$CANDIDATE_CONFIG" 2>/dev/null | awk '$1 == "port" { print $2 }')
+if (( ${#EFFECTIVE_PORTS[@]} != 1 )) || [[ ${EFFECTIVE_PORTS[0]:-} != "$NEW_PORT" ]]; then
+    if (( ${#EFFECTIVE_PORTS[@]} )); then
+        printf '%s\n' "${EFFECTIVE_PORTS[@]}" >&2
     else
-        echo -e "${GREEN}确认: 默认 22 端口已关闭。${PLAIN}"
+        echo '(none)' >&2
     fi
-
-    echo -e "\n${RED}【切记】请在防火墙 (UFW/云安全组) 放行端口 $NEW_PORT ！！！${PLAIN}"
-    echo -e "建议命令(如果是UFW): sudo ufw allow $NEW_PORT/tcp"
-else
-    echo -e "${RED}失败: 服务重启后未检测到新端口监听，请检查 journalctl -xe 查看错误。${PLAIN}"
-    # 如果失败，尝试回滚 socket mask，防止失联（可选）
-    # systemctl unmask ssh.socket
+    die "候选配置的有效 Port 不是唯一的 $NEW_PORT；请检查 $CONFIG_DIR 中的自定义 Port 配置。"
 fi
+
+BACKUP_FILE="/etc/ssh/sshd_config.bak.$(date +%F_%H%M%S)"
+cp --preserve=mode,ownership,timestamps -- "$CONFIG_FILE" "$BACKUP_FILE"
+cp --preserve=mode,ownership,timestamps -- "$CANDIDATE_CONFIG" "$CONFIG_FILE"
+echo -e "${GREEN}已备份原配置至: $BACKUP_FILE${PLAIN}"
+
+# Ubuntu releases using socket activation can keep port 22 open independently
+# of sshd_config.  Stop and disable it, but do not mask it permanently.
+if systemctl list-unit-files --type=socket --no-legend 2>/dev/null | awk '$1 == "ssh.socket" { found = 1 } END { exit !found }'; then
+    echo -e "${YELLOW}检测到 ssh.socket，正在停止并禁用它...${PLAIN}"
+    systemctl disable --now ssh.socket || die '无法停止并禁用 ssh.socket。'
+fi
+
+echo -e "${YELLOW}正在重启 $SSH_SERVICE...${PLAIN}"
+systemctl restart "$SSH_SERVICE" || die "$SSH_SERVICE 重启失败；请通过控制台检查 journalctl -u $SSH_SERVICE。"
+systemctl is-active --quiet "$SSH_SERVICE" || die "$SSH_SERVICE 未处于运行状态。"
+
+if ! ss -H -ltn | awk -v port="$NEW_PORT" '$4 ~ (":" port "$") { found = 1 } END { exit !found }'; then
+    die "未检测到 TCP/$NEW_PORT 正在监听。"
+fi
+
+echo -e "${GREEN}SUCCESS: SSH 已监听 TCP/$NEW_PORT。${PLAIN}"
+if ss -H -ltn | awk '$4 ~ /:22$/ { found = 1 } END { exit !found }'; then
+    echo -e "${YELLOW}警告：22 端口仍在监听；请检查是否有其他服务或自定义 SSH 配置。${PLAIN}"
+else
+    echo -e "${GREEN}确认：未检测到 22 端口监听。${PLAIN}"
+fi
+
+echo -e "${YELLOW}请用新会话测试：ssh -p $NEW_PORT <user>@<server-ip>${PLAIN}"
